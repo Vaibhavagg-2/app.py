@@ -1,0 +1,1148 @@
+from typing import List, Dict, Any
+from flask import Flask, render_template, jsonify, request, session, url_for, redirect
+from requests.exceptions import RequestException
+import requests
+import base64
+import os
+from dotenv import load_dotenv
+from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+from functools import wraps
+import secrets
+import string
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(
+    filename="app.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Load environment variables
+load_dotenv()
+ORGANIZATION = os.getenv("AZURE_ORGANIZATION")
+PAT = os.getenv("AZURE_PAT")
+AUTHORIZED_USERS = os.getenv("AUTHORIZED_USERS", "").split(",")
+
+app = Flask(__name__)
+app.config["JSON_SORT_KEYS"] = False
+app.config["SECRET_KEY"] = os.urandom(24)
+
+# In-memory cache
+cache: Dict[str, Dict[str, Any]] = {
+    "projects": {"data": [], "timestamp": 0, "ttl": 300},
+    "stats": {"data": {}, "timestamp": 0, "ttl": 300},
+}
+
+def get_auth_header() -> Dict[str, str]:
+    """Return authorization header for Azure DevOps API."""
+    if not PAT:
+        raise ValueError("AZURE_PAT not set")
+    encoded_pat = base64.b64encode(f":{PAT}".encode()).decode()
+    return {
+        "Authorization": f"Basic {encoded_pat}",
+        "Content-Type": "application/json"
+    }
+
+def get_all_projects() -> List[Dict[str, Any]]:
+    """Fetch all projects from Azure DevOps with caching."""
+    if time.time() - cache["projects"]["timestamp"] < cache["projects"]["ttl"]:
+        return cache["projects"]["data"]
+    try:
+        url = (
+            f"https://dev.azure.com/{ORGANIZATION}/_apis/projects?"
+            f"api-version=7.1-preview.4"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        projects = response.json().get("value", [])
+        cache["projects"]["data"] = projects
+        cache["projects"]["timestamp"] = time.time()
+        return projects
+    except RequestException as e:
+        logging.error("Error fetching projects: %s", e)
+        return []
+
+def get_project_build_status_counts(project_id: str, project_name: str) -> Dict[str, int]:
+    """Fetch build status counts for a project."""
+    try:
+        url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/build/builds?$top=50&api-version=7.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        builds = response.json().get("value", [])
+        status_counts = {"inProgress": 0, "notStarted": 0, "completed": 0, "canceled": 0}
+        for build in builds:
+            status = build.get("status", "canceled").lower()
+            status_counts[status] += 1
+        return status_counts
+    except RequestException as e:
+        logging.error("Error fetching build statuses for %s: %s", project_name, e)
+        return {"inProgress": 0, "notStarted": 0, "completed": 0, "canceled": 0}
+
+def get_pipeline_results(project_id: str, project_name: str) -> Dict[str, int]:
+    """Fetch pipeline result counts for a project."""
+    try:
+        url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/pipelines?api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        pipeline_ids = [p["id"] for p in response.json().get("value", [])]
+        results = {"succeeded": 0, "failed": 0, "canceled": 0}
+        for pipeline_id in pipeline_ids:
+            builds_url = (
+                f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+                f"_apis/build/builds?definitions={pipeline_id}&$top=50&api-version=7.1"
+            )
+            builds_response = requests.get(
+                builds_url, headers=get_auth_header(), timeout=10.0
+            )
+            builds_response.raise_for_status()
+            builds = builds_response.json().get("value", [])
+            for build in builds:
+                result = build.get("result", "canceled").lower()
+                results[result] += 1
+        return results
+    except RequestException as e:
+        logging.error("Error fetching pipeline results for %s: %s", project_name, e)
+        return {"succeeded": 0, "failed": 0, "canceled": 0}
+
+def get_workitem_state_counts(project_id: str, project_name: str) -> Dict[str, int]:
+    """Fetch work item state counts for a project."""
+    try:
+        wiql_query = (
+            f"SELECT [System.Id], [System.State] FROM workitems "
+            f"WHERE [System.TeamProject] = '{project_name}'"
+        )
+        wiql_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/wit/wiql?api-version=7.1"
+        )
+        response = requests.post(
+            wiql_url,
+            headers=get_auth_header(),
+            json={"query": wiql_query},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        workitem_ids = [item["id"] for item in response.json().get("workItems", [])][:200]
+        if not workitem_ids:
+            return {}
+        batch_size = 50
+        state_counts = defaultdict(int)
+        for i in range(0, len(workitem_ids), batch_size):
+            batch_ids = workitem_ids[i:i + batch_size]
+            workitems_url = (
+                f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+                f"_apis/wit/workitems?ids={','.join(map(str, batch_ids))}&"
+                f"fields=System.State&api-version=7.1"
+            )
+            response = requests.get(
+                workitems_url, headers=get_auth_header(), timeout=10.0
+            )
+            response.raise_for_status()
+            for item in response.json().get("value", []):
+                state = item.get("fields", {}).get("System.State", "Unknown")
+                state_counts[state] += 1
+        return dict(state_counts)
+    except RequestException as e:
+        logging.error("Error fetching work item states for %s: %s", project_name, e)
+        return {}
+
+def get_deployment_group_status_counts(
+    project_id: str, project_name: str
+) -> Dict[str, int]:
+    """Fetch deployment group status counts for a project."""
+    try:
+        url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/distributedtask/deploymentgroups?api-version=6.1-preview"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        groups = response.json().get("value", [])
+        status_counts = {"online": 0, "offline": 0, "unknown": 0}
+        for group in groups:
+            targets_url = (
+                f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+                f"_apis/distributedtask/deploymentgroups/{group['id']}/"
+                f"targets?api-version=6.1-preview"
+            )
+            response = requests.get(targets_url, headers=get_auth_header(), timeout=10.0)
+            status = "unknown"
+            if response.ok:
+                targets = response.json().get("value", [])
+                status = "online" if any(
+                    t.get("agent", {}).get("status") == "online" for t in targets
+                ) else "offline"
+            status_counts[status] += 1
+        return status_counts
+    except RequestException as e:
+        logging.error("Error fetching deployment statuses for %s: %s", project_name, e)
+        return {"online": 0, "offline": 0, "unknown": 0}
+
+def validate_login(user_id: str, password: str) -> bool:
+    """Validate user login credentials against external auth service."""
+    try:
+        base_url = "http://rgiadauth.reliancecapital.com:8081/api/Values"
+        encrypt_user_id = encode(user_id)
+        encrypt_pass = encode(password)
+        uid = get_unique_key(10)
+        upass = get_unique_key(10)
+        encrypt_user_id = uid + encrypt_user_id + get_unique_key(5)
+        encrypt_pass = upass + encrypt_pass + get_unique_key(5)
+        parameter = f"/ID={encrypt_user_id}/?value={encrypt_pass}"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        response = requests.get(
+            base_url + parameter,
+            headers=headers,
+            timeout=5.0
+        )
+        response.raise_for_status()
+        return response.text.lower() == "true"
+    except RequestException as e:
+        logging.error("Error validating login for %s: %s", user_id, e)
+        return False
+
+def encode(text: str) -> str:
+    """Encode text to base64."""
+    return base64.b64encode(text.encode("utf-8")).decode("utf-8")
+
+def get_unique_key(size: int) -> str:
+    """Generate a random key of specified size."""
+    chars = string.ascii_letters + string.digits
+    return "".join(secrets.choice(chars) for _ in range(size))
+
+def login_required(f):
+    """Decorator to require login for routes."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "user_id" not in session:
+            return redirect(url_for("login"))
+        if session["user_id"] not in AUTHORIZED_USERS:            return jsonify({"success": False, "error": "Unauthorized access"}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Handle user login."""
+    if request.method == "GET":
+        return render_template("login.html")
+    sap_id = request.form.get("sap_id")
+    password = request.form.get("password")
+    if not sap_id or not password:
+        return jsonify(
+            {"success": False, "error": "SAP ID and password required"}
+        ), 400
+    if validate_login(sap_id, password):
+        if sap_id in AUTHORIZED_USERS:
+            session["user_id"] = sap_id
+            return jsonify({"success": True, "redirect": url_for("index")})
+        return jsonify(
+            {"success": False, "error": "Unauthorized user"}
+        ), 403
+    return jsonify(
+        {"success": False, "error": "Invalid credentials"}
+    ), 401
+
+@app.route("/logout")
+@login_required
+def logout():
+    """Handle user logout."""
+    session.pop("user_id", None)
+    return redirect(url_for("login"))
+
+@app.route("/")
+@login_required
+def index():
+    """Render the main dashboard."""
+    return render_template("index.html", sap_id=session.get("user_id", "Guest"))
+
+@app.route("/api/projects")
+@login_required
+def get_projects():
+    """Fetch all projects."""
+    try:
+        return jsonify(get_all_projects())
+    except RequestException as e:
+        logging.error("Error fetching projects: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>")
+@login_required
+def get_project_detail(project_id: str):
+    """Fetch details for a specific project."""
+    try:
+        url = (
+            f"https://dev.azure.com/{ORGANIZATION}/_apis/projects/"
+            f"{project_id}?api-version=7.1-preview.4"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        return jsonify(response.json())
+    except RequestException as e:
+        logging.error("Error fetching project %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/users")
+@login_required
+def get_project_users(project_id: str):
+    """Fetch users for a specific project."""
+    try:
+        url = (
+            f"https://vsaex.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/userentitlements?top=100&api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        users = [
+            {
+                "id": user["user"].get("principalName", ""),
+                "name": user["user"].get("displayName", ""),
+                "email": user["user"].get("mailAddress", ""),
+                "license": user.get("accessLevel", {}).get("licenseDisplayName", "Unknown")
+            }
+            for user in response.json().get("value", [])
+        ]
+        return jsonify(users)
+    except RequestException as e:
+        logging.error("Error fetching users for project %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/users")
+@login_required
+def get_users():
+    """Fetch all users with optional license filter."""
+    try:
+        license_filter = request.args.get("license", "").lower()
+        url = (
+            f"https://vsaex.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/userentitlements?top=50&api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        users = [
+            {
+                "id": item["id"],
+                "name": item["user"].get("displayName", ""),
+                "email": item["user"].get("mailAddress", ""),
+                "license": item.get("accessLevel", {}).get("licenseDisplayName", "Unknown")
+            }
+            for item in response.json().get("value", [])
+            if not license_filter or item.get("accessLevel", {}).get(
+                "licenseDisplayName", ""
+            ).lower() == license_filter
+        ]
+        return jsonify(users)
+    except RequestException as e:
+        logging.error("Error fetching users: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/users/license-summary")
+@login_required
+def get_license_results():
+    """Fetch summary of user license counts."""
+    try:
+        url = (
+            f"https://vsaex.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/userentitlements?top=100&api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        license_counts = defaultdict(int)
+        for item in response.json().get("value", []):
+            license = item.get("accessLevel", {}).get("licenseDisplayName", "Unknown")
+            license_counts[license] += 1
+        return jsonify([
+            {"license": key, "count": value}
+            for key, value in license_counts.items()
+        ])
+    except RequestException as e:
+        logging.error("Error fetching license results: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/deployment-groups")
+@login_required
+def get_deployment_groups(project_id: str):
+    """Fetch deployment groups for a project."""
+    try:
+        project_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/_apis/projects/"
+            f"{project_id}?api-version=7.1-preview.4"
+        )
+        response = requests.get(project_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        project_name = response.json().get("name", "")
+        groups_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/distributedtask/deploymentgroups?api-version=6.1-preview"
+        )
+        response = requests.get(groups_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        groups = response.json().get("value", [])
+        for group in groups:
+            targets_url = (
+                f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+                f"_apis/distributedtask/deploymentgroups/{group['id']}/"
+                f"targets?api-version=6.1-preview"
+            )
+            response = requests.get(targets_url, headers=get_auth_header(), timeout=10.0)
+            group["status"] = "unknown"
+            if response.ok:
+                targets = response.json().get("value", [])
+                group["status"] = "online" if any(
+                    t.get("agent", {}).get("status") == "online" for t in targets
+                ) else "offline"
+        return jsonify(groups)
+    except RequestException as e:
+        logging.error("Error fetching deployment groups for %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/groups")
+@login_required
+def get_project_groups(project_id: str):
+    """Fetch groups for a specific project."""
+    try:
+        url = (
+            f"https://vssps.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/graph/descriptors/{project_id}?api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        scope = response.json().get("value")
+        if not scope:
+            return jsonify({"success": False, "error": "Cannot get scope descriptor"}), 404
+        groups_url = (
+            f"https://vssps.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/graph/groups?scopeDescriptor={scope}&api-version=7.1-preview.1"
+        )
+        response = requests.get(groups_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        groups = [
+            {"name": g["displayName"], "id": g["descriptor"]}
+            for g in response.json().get("value", [])
+        ]
+        return jsonify(groups)
+    except RequestException as e:
+        logging.error("Error fetching groups for project %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/group/<path:group_descriptor>/members")
+@login_required
+def get_group_members(project_id: str, group_descriptor: str):
+    """Fetch members of a specific group in a project."""
+    try:
+        url = (
+            f"https://vssps.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/graph/memberships/{group_descriptor}?direction=down"
+            f"&api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        memberships = response.json().get("value", [])
+        members = []
+        for relation in memberships:
+            member_descriptor = relation.get("memberDescriptor")
+            if member_descriptor:
+                user_url = (
+                    f"https://vssps.dev.azure.com/{ORGANIZATION}/"
+                    f"_apis/graph/users/{member_descriptor}?api-version=7.1-preview.1"
+                )
+                user_response = requests.get(
+                    user_url, headers=get_auth_header(), timeout=10.0
+                )
+                if user_response.ok:
+                    user = user_response.json()
+                    members.append({
+                        "name": user.get("displayName", ""),
+                        "principalName": user.get("principalName", ""),
+                        "email": user.get("mailAddress", ""),
+                        "descriptor": member_descriptor
+                    })
+        return jsonify(members)
+    except RequestException as e:
+        logging.error("Error fetching group members for %s: %s", group_descriptor, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/user/<descriptor>")
+@login_required
+def get_user_detail(descriptor: str):
+    """Fetch details for a specific user."""
+    try:
+        url = (
+            f"https://vssps.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/graph/users/{descriptor}?api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        user = response.json()
+        return jsonify({
+            "name": user.get("displayName", ""),
+            "principalName": user.get("principalName", ""),
+            "email": user.get("mailAddress", ""),
+            "descriptor": descriptor
+        })
+    except RequestException as e:
+        logging.error("Error fetching user %s: %s", descriptor, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/builds")
+@login_required
+def get_project_builds(project_id: str):
+    """Fetch builds for a specific project with optional status filter."""
+    try:
+        project_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/_apis/projects/"
+            f"{project_id}?api-version=7.1-preview.4"
+        )
+        response = requests.get(project_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        project_name = response.json().get("name", "")
+        status_filter = request.args.get("status", "").lower()
+        builds_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/build/builds?$top=50&api-version=7.1"
+        )
+        if status_filter:
+            builds_url += f"&statusFilter={status_filter}"
+        response = requests.get(builds_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        builds = response.json().get("value", [])
+        if status_filter:
+            return jsonify([
+                {
+                    "id": b.get("id", ""),
+                    "name": b.get("definition", {}).get("name", "Unknown"),
+                    "status": b.get("status", ""),
+                    "startTime": b.get("startTime", "N/A")
+                }
+                for b in builds
+            ])
+        status_counts = {"inProgress": 0, "notStarted": 0, "completed": 0, "canceled": 0}
+        for build in builds:
+            status = build.get("status", "canceled").lower()
+            status_counts[status] += 1
+        return jsonify(status_counts)
+    except RequestException as e:
+        logging.error("Error fetching builds for project %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/pipelines")
+@login_required
+def get_project_pipelines(project_id: str):
+    """Fetch pipelines for a project with optional result filter."""
+    try:
+        project_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/_apis/projects/"
+            f"{project_id}?api-version=7.1-preview.4"
+        )
+        response = requests.get(project_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        project_name = response.json().get("name", "")
+        result_filter = request.args.get("result", "").lower()
+        pipelines_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/pipelines?api-version=7.1-preview.1"
+        )
+        response = requests.get(pipelines_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        pipeline_ids = [p["id"] for p in response.json().get("value", [])]
+        if result_filter:
+            runs = []
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [
+                    executor.submit(
+                        requests.get,
+                        (
+                            f"https://dev.azure.com/{ORGANIZATION}/"
+                            f"{quote(project_name)}/_apis/build/builds?"
+                            f"definitions={pid}&$top=50&api-version=7.1"
+                        ),
+                        headers=get_auth_header(),
+                        timeout=10.0
+                    )
+                    for pid in pipeline_ids
+                ]
+                for future in futures:
+                    response = future.result()
+                    response.raise_for_status()
+                    builds = response.json().get("value", [])
+                    for build in builds:
+                        if build.get("result", "").lower() == result_filter:
+                            runs.append({
+                                "id": build.get("id", ""),
+                                "name": build.get("definition", {}).get("name", "Unknown"),
+                                "result": build.get("result", ""),
+                                "startTime": build.get("startTime", "N/A")
+                            })
+            return jsonify(runs)
+        results = {"succeeded": 0, "failed": 0, "canceled": 0}
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(
+                    requests.get,
+                    (
+                        f"https://dev.azure.com/{ORGANIZATION}/"
+                        f"{quote(project_name)}/_apis/build/builds?"
+                        f"definitions={pid}&$top=50&api-version=7.1"
+                    ),
+                    headers=get_auth_header(),
+                    timeout=10.0
+                )
+                for pid in pipeline_ids
+            ]
+            for future in futures:
+                response = future.result()
+                if response.ok:
+                    builds = response.json().get("value", [])
+                    for build in builds:
+                        result = build.get("result", "canceled").lower()
+                        results[result] += 1
+        return jsonify(results)
+    except RequestException as e:
+        logging.error("Error fetching pipelines for project %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/project/<project_id>/workitems")
+@login_required
+def get_project_workitems(project_id: str):
+    """Fetch work items for a project with optional filters."""
+    try:
+        project_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/_apis/projects/"
+            f"{project_id}?api-version=7.1-preview.4"
+        )
+        response = requests.get(project_url, headers=get_auth_header(), timeout=10.0)
+        response.raise_for_status()
+        project_name = response.json().get("name", "")
+        type_filter = request.args.get("type", "")
+        state_filter = request.args.get("state", "")
+        wiql_query = (
+            f"SELECT [System.Id], [System.WorkItemType], [System.State], "
+            f"[System.Title], [System.AssignedTo] FROM workitems "
+            f"WHERE [System.TeamProject] = '{project_name}'"
+        )
+        if type_filter or state_filter:
+            conditions = []
+            if type_filter:
+                conditions.append(f"[System.WorkItemType] = '{type_filter}'")
+            if state_filter:
+                conditions.append(f"[System.State] = '{state_filter}'")
+            wiql_query += " AND " + " AND ".join(conditions)
+        wiql_url = (
+            f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+            f"_apis/wit/wiql?api-version=7.1"
+        )
+        response = requests.post(
+            wiql_url,
+            headers=get_auth_header(),
+            json={"query": wiql_query},
+            timeout=10.0
+        )
+        response.raise_for_status()
+        workitem_ids = [item["id"] for item in response.json().get("workItems", [])][:200]
+        if not workitem_ids:
+            return jsonify([])
+        batch_size = 50
+        workitems = []
+        for i in range(0, len(workitem_ids), batch_size):
+            batch_ids = workitem_ids[i:i + batch_size]
+            workitems_url = (
+                f"https://dev.azure.com/{ORGANIZATION}/{quote(project_name)}/"
+                f"_apis/wit/workitems?ids={','.join(map(str, batch_ids))}&"
+                f"fields=System.Id,System.WorkItemType,System.State,System.Title,"
+                f"System.AssignedTo&api-version=7.1"
+            )
+            response = requests.get(
+                workitems_url, headers=get_auth_header(), timeout=10.0
+            )
+            response.raise_for_status()
+            for item in response.json().get("value", []):
+                fields = item.get("fields", {})
+                workitems.append({
+                    "id": item.get("id", ""),
+                    "title": fields.get("System.Title", "Untitled"),
+                    "type": fields.get("System.WorkItemType", "Unknown"),
+                    "state": fields.get("System.State", "Unknown"),
+                    "assignee": fields.get("System.AssignedTo", {}).get(
+                        "displayName", "Unassigned"
+                    )
+                })
+        return jsonify(workitems)
+    except RequestException as e:
+        logging.error("Error fetching work items for project %s: %s", project_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/project-states")
+@login_required
+def get_organization_project_states():
+    """Fetch project state counts across the organization."""
+    try:
+        projects = get_all_projects()
+        state_counts = defaultdict(int)
+        for project in projects:
+            state_counts[project.get("state", "Unknown")] += 1
+        return jsonify([
+            {"state": key, "count": value}
+            for key, value in state_counts.items()
+        ])
+    except RequestException as e:
+        logging.error("Error fetching project states: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/build-statuses")
+@login_required
+def get_organization_build_statuses():
+    """Fetch build status counts across the organization."""
+    try:
+        projects = get_all_projects()
+        total_status_counts = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_project_build_status_counts, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                counts = future.result()
+                for status, count in counts.items():
+                    total_status_counts[status] += count
+        return jsonify(dict(total_status_counts))
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error fetching build statuses: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/pipeline-results")
+@login_required
+def get_organization_pipeline_results():
+    """Fetch pipeline result counts across the organization."""
+    try:
+        projects = get_all_projects()
+        total_results = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_pipeline_results, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                results = future.result()
+                for result, count in results.items():
+                    total_results[result] += count
+        return jsonify(dict(total_results))
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error fetching pipeline results: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/workitem-states")
+@login_required
+def get_organization_workitem_states():
+    """Fetch work item state counts across the organization."""
+    try:
+        projects = get_all_projects()
+        total_state_counts = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_workitem_state_counts, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                state_counts = future.result()
+                for state, count in state_counts.items():
+                    total_state_counts[state] += count
+        return jsonify([
+            {"state": key, "count": value}
+            for key, value in total_state_counts.items()
+        ])
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error fetching work item states: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/deployment-group-statuses")
+@login_required
+def get_organization_deployment_group_statuses():
+    """Fetch deployment group status counts across the organization."""
+    try:
+        projects = get_all_projects()
+        total_status_counts = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_deployment_group_status_counts, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                status_counts = future.result()
+                for status, count in status_counts.items():
+                    total_status_counts[status] += count
+        return jsonify(dict(total_status_counts))
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error fetching deployment group statuses: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/projects")
+@login_required
+def get_organization_projects():
+    """Fetch projects with optional state filter."""
+    try:
+        state_filter = request.args.get("state", "").lower()
+        projects = get_all_projects()
+        filtered = [
+            {
+                "id": p.get("id", ""),
+                "name": p.get("name", ""),
+                "state": p.get("state", "")
+            }
+            for p in projects
+            if not state_filter or p.get("state", "").lower() == state_filter
+        ]
+        return jsonify(filtered[:100])
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error fetching projects: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/builds")
+@login_required
+def get_organization_builds():
+    """Fetch builds with a specific status."""
+    try:
+        status_filter = request.args.get("status", "").lower()
+        projects = get_all_projects()
+        builds = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(
+                    requests.get,
+                    (
+                        f"https://dev.azure.com/{ORGANIZATION}/{quote(p['name'])}/"
+                        f"_apis/build/builds?$top=50"
+                        f"&statusFilter={status_filter}&api-version=7.1"
+                    ),
+                    headers=get_auth_header(),
+                    timeout=10.0
+                )
+                for p in projects
+            ]
+            for idx, future in enumerate(futures):
+                response = future.result()
+                response.raise_for_status()
+                project_builds = response.json().get("value", [])
+                for build in project_builds:
+                    builds.append({
+                        "id": build.get("id", ""),
+                        "name": build.get("definition", {}).get("name", "Unknown"),
+                        "status": build.get("status", ""),
+                        "source": build.get("sourceBranch", "N/A"),
+                        "project": {"name": projects[idx]["name"]}
+                    })
+        return jsonify(builds[:50])
+    except RequestException as e:
+        logging.error("Error fetching builds: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/pipelines")
+@login_required
+def get_organization_pipelines():
+    """Fetch pipelines with a specific result or summary."""
+    try:
+        result_filter = request.args.get("result", "").lower()
+        projects = get_all_projects()
+        if not result_filter:
+            total_results = defaultdict(int)
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [
+                    executor.submit(get_pipeline_results, p["id"], p["name"])
+                    for p in projects
+                ]
+                for future in futures:
+                    results = future.result()
+                    for result, count in results.items():
+                        total_results[result] += count
+            return jsonify(dict(total_results))
+        runs = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for project in projects:
+                pipelines_url = (
+                    f"https://dev.azure.com/{ORGANIZATION}/{quote(project['name'])}/"
+                    f"_apis/pipelines?api-version=7.1-preview.1"
+                )
+                response = requests.get(
+                    pipelines_url, headers=get_auth_header(), timeout=10.0
+                )
+                response.raise_for_status()
+                pipeline_ids = [p["id"] for p in response.json().get("value", [])]
+                futures = [
+                    executor.submit(
+                        requests.get,
+                        (
+                            f"https://dev.azure.com/{ORGANIZATION}/"
+                            f"{quote(project['name'])}/_apis/build/builds?"
+                            f"definitions={pid}&$top=10&api-version=7.1"
+                        ),
+                        headers=get_auth_header(),
+                        timeout=10.0
+                    )
+                    for pid in pipeline_ids
+                ]
+                for future in futures:
+                    response = future.result()
+                    if response.ok:
+                        builds = response.json().get("value", [])
+                        for build in builds:
+                            if build.get("result", "").lower() == result_filter:
+                                runs.append({
+                                    "id": build.get("id", ""),
+                                    "name": build.get("definition", {}).get(
+                                        "name", "Unknown"
+                                    ),
+                                    "result": build.get("result", ""),
+                                    "project": {"name": project["name"]}
+                                })
+                    else:
+                        logging.warning(
+                            "Failed to fetch pipelines for %s: %s",
+                            project["name"],
+                            response.status_code
+                        )
+        return jsonify(runs[:100])
+    except RequestException as e:
+        logging.error("Error fetching pipelines: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/workitems")
+@login_required
+def get_organization_workitems():
+    """Fetch work items with a specific state or all."""
+    try:
+        state_filter = request.args.get("state", "")
+        projects = get_all_projects()
+        workitems = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for project in projects:
+                wiql_query = (
+                    f"SELECT [System.Id], [System.WorkItemType], [System.State], "
+                    f"[System.Title], [System.AssignedTo] FROM workitems "
+                    f"WHERE [System.TeamProject] = '{project['name']}'"
+                )
+                if state_filter:
+                    wiql_query += f" AND [System.State] = '{state_filter}'"
+                wiql_url = (
+                    f"https://dev.azure.com/{ORGANIZATION}/{quote(project['name'])}/"
+                    f"_apis/wit/wiql?api-version=7.1"
+                )
+                response = requests.post(
+                    wiql_url,
+                    headers=get_auth_header(),
+                    json={"query": wiql_query},
+                    timeout=10.0
+                )
+                if not response.ok:
+                    logging.warning(
+                        "Failed to fetch work items for %s: %s",
+                        project["name"],
+                        response.status_code
+                    )
+                    continue
+                workitem_ids = [
+                    item["id"] for item in response.json().get("workItems", [])
+                ][:200]
+                if not workitem_ids:
+                    continue
+                batch_size = 50
+                futures = [
+                    executor.submit(
+                        requests.get,
+                        (
+                            f"https://dev.azure.com/{ORGANIZATION}/"
+                            f"{quote(project['name'])}/_apis/wit/workitems?"
+                            f"ids={','.join(map(str, workitem_ids[i:i + batch_size]))}&"
+                            f"fields=System.Id,System.WorkItemType,System.State,"
+                            f"System.Title,System.AssignedTo&api-version=7.1"
+                        ),
+                        headers=get_auth_header(),
+                        timeout=10.0
+                    )
+                    for i in range(0, len(workitem_ids), batch_size)
+                ]
+                for future in futures:
+                    response = future.result()
+                    if response.ok:
+                        for item in response.json().get("value", []):
+                            fields = item.get("fields", {})
+                            workitems.append({
+                                "id": item.get("id", ""),
+                                "title": fields.get("System.Title", "Untitled"),
+                                "type": fields.get("System.WorkItemType", "Unknown"),
+                                "state": fields.get("System.State", "Unknown"),
+                                "project": {"name": project["name"]}
+                            })
+                    else:
+                        logging.warning(
+                            "Failed to fetch work item details for %s: %s",
+                            project["name"],
+                            response.status_code
+                        )
+        return jsonify(workitems[:100])
+    except RequestException as e:
+        logging.error("Error fetching work items: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/deployment-groups")
+@login_required
+def get_organization_deployment_groups():
+    """Fetch deployment groups with a specific status or all."""
+    try:
+        status_filter = request.args.get("status", "").lower()
+        projects = get_all_projects()
+        groups = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for project in projects:
+                groups_url = (
+                    f"https://dev.azure.com/{ORGANIZATION}/{quote(project['name'])}/"
+                    f"_apis/distributedtask/deploymentgroups?api-version=6.1-preview"
+                )
+                response = requests.get(
+                    groups_url, headers=get_auth_header(), timeout=10.0
+                )
+                if not response.ok:
+                    logging.warning(
+                        "Failed to fetch deployment groups for %s: %s",
+                        project["name"],
+                        response.status_code
+                    )
+                    continue
+                project_groups = response.json().get("value", [])
+                futures = [
+                    executor.submit(
+                        requests.get,
+                        (
+                            f"https://dev.azure.com/{ORGANIZATION}/"
+                            f"{quote(project['name'])}/_apis/distributedtask/"
+                            f"deploymentgroups/{g['id']}/targets?api-version=6.1-preview"
+                        ),
+                        headers=get_auth_header(),
+                        timeout=10.0
+                    )
+                    for g in project_groups
+                ]
+                for idx, future in enumerate(futures):
+                    response = future.result()
+                    group_status = "unknown"
+                    if response.ok:
+                        targets = response.json().get("value", [])
+                        group_status = "online" if any(
+                            t.get("agent", {}).get("status") == "online" for t in targets
+                        ) else "offline"
+                    if not status_filter or group_status == status_filter:
+                        group = project_groups[idx]
+                        group["status"] = group_status
+                        group["project"] = {"name": project["name"]}
+                        groups.append(group)
+        return jsonify(groups[:100])
+    except RequestException as e:
+        logging.error("Error fetching deployment groups: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/organization/all-stats")
+@login_required
+def get_all_stats():
+    """Fetch all organization statistics with cache."""
+    try:
+        if (
+            time.time() - cache["stats"]["timestamp"] < cache["stats"]["ttl"]
+            and cache["stats"]["data"]
+        ):
+            return jsonify(cache["stats"]["data"])
+        stats = {
+            "project_states": [],
+            "build_statuses": {},
+            "pipeline_results": {},
+            "workitem_states": [],
+            "deployment_group_statuses": {},
+            "license_counts": []
+        }
+        projects = get_all_projects()
+        # Project states
+        state_counts = defaultdict(int)
+        for project in projects:
+            state_counts[project.get("state", "Unknown")] += 1
+        stats["project_states"] = [
+            {"state": k, "count": v} for k, v in state_counts.items()
+        ]
+        # Build statuses
+        total_status_counts = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_project_build_status_counts, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                counts = future.result()
+                for status, count in counts.items():
+                    total_status_counts[status] += count
+        stats["build_statuses"] = dict(total_status_counts)
+        # Pipeline results
+        total_results = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_pipeline_results, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                results = future.result()
+                for result, count in results.items():
+                    total_results[result] += count
+        stats["pipeline_results"] = dict(total_results)
+        # Work item states
+        total_state_counts = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_workitem_state_counts, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                state_counts = future.result()
+                for state, count in state_counts.items():
+                    total_state_counts[state] += count
+        stats["workitem_states"] = [
+            {"state": k, "count": v} for k, v in total_state_counts.items()
+        ]
+        # Deployment group statuses
+        total_deployment_statuses = defaultdict(int)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(get_deployment_group_status_counts, p["id"], p["name"])
+                for p in projects
+            ]
+            for future in futures:
+                status_counts = future.result()
+                for status, count in status_counts.items():
+                    total_deployment_statuses[status] += count
+        stats["deployment_group_statuses"] = dict(total_deployment_statuses)
+        # License counts
+        url = (
+            f"https://vsaex.dev.azure.com/{ORGANIZATION}/"
+            f"_apis/userentitlements?top=100&api-version=7.1-preview.1"
+        )
+        response = requests.get(url, headers=get_auth_header(), timeout=10.0)
+        if response.ok:
+            license_counts = defaultdict(int)
+            for item in response.json().get("value", []):
+                license = item.get("accessLevel", {}).get("licenseDisplayName", "Unknown")
+                license_counts[license] += 1
+            stats["license_counts"] = [
+                {"license": k, "count": v} for k, v in license_counts.items()
+            ]
+        cache["stats"]["data"] = stats
+        cache["stats"]["timestamp"] = time.time()
+        return jsonify(stats)
+    except Exception as e:  # pylint: disable=broad-except
+        logging.error("Error fetching stats: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, debug=True)
